@@ -1,4 +1,4 @@
-# Pas le Temps d'Niaiser ! (PTN)
+# Pas l'Temps d'Niaiser ! (PTN)
 
 PTN est une interface graphique cross-platform minimaliste développée en **.NET 10 / Avalonia UI**.
 
