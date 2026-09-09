@@ -8,6 +8,7 @@ Elle permet de télécharger des séries TV (ou des saisons spécifiques) partag
 
 L'application est fonctionnelle mais toujours en version de test et peut donc présenter des bugs.
 
-<img width="886" height="643" alt="image" src="https://github.com/user-attachments/assets/616a6894-cd16-4265-a42d-5200e1dbc890" />
+<img width="886" height="643" alt="image" src="https://github.com/user-attachments/assets/3d1629c2-cb58-48f7-80a8-bc861941ed85" />
+
 
 
