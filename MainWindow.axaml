@@ -3,7 +3,7 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     xmlns:local="using:PTN"
     x:Class="PTN.MainWindow"
-    Title="Pas le Temps d'Niaiser !"
+    Title="Pas l'Temps d'Niaiser !"
     Width="1050"
     Height="720"
     MinWidth="850"
@@ -99,7 +99,7 @@
 
             <TextBlock
                 Classes="title"
-                Text="Pas le Temps d'Niaiser !"/>
+                Text="Pas l'Temps d'Niaiser !"/>
 
             <TextBlock
                 Classes="subtitle"
