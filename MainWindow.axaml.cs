@@ -10,7 +10,6 @@ using System.Text.RegularExpressions;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
-using Avalonia.Input.Platform;
 using Avalonia.Interactivity;
 using Avalonia.Platform.Storage;
 using Avalonia.Threading;
@@ -49,6 +48,73 @@ public partial class MainWindow : Window
             ".flv"
         };
 
+    /*
+     * Une série standard doit posséder au moins un dossier :
+     *
+     *   Saison 1
+     *   Saison 2
+     *   Season 1
+     *   S1
+     *
+     * Kaamelott utilise :
+     *
+     *   Livre I
+     *   Livre II
+     *   Livre III
+     *
+     * Specials est traité comme un bonus et ne peut jamais,
+     * à lui seul, constituer une série.
+     */
+
+    private static readonly Regex SeasonDirectoryRegex =
+        new(
+            @"^(?:saison|season)\s*(?<number>\d+)$|^s(?<short>\d+)$",
+            RegexOptions.IgnoreCase |
+            RegexOptions.Compiled);
+
+    private static readonly Regex BookDirectoryRegex =
+        new(
+            @"^livre\s+(?<number>[IVXLCDM]+)$",
+            RegexOptions.IgnoreCase |
+            RegexOptions.Compiled);
+
+    private static readonly Regex SpecialsDirectoryRegex =
+        new(
+            @"^specials?$",
+            RegexOptions.IgnoreCase |
+            RegexOptions.Compiled);
+
+    /*
+     * Formats acceptés :
+     *
+     * S1E1
+     * S01E1
+     * S1E01
+     * S01E01
+     *
+     * L1T1
+     * L01T1
+     * L1T01
+     * L01T01
+     */
+    private static readonly Regex StandardEpisodeRegex =
+        new(
+            @"(?<![A-Z0-9])S(?<season>\d{1,3})E(?<episode>\d{1,3})(?![A-Z0-9])",
+            RegexOptions.IgnoreCase |
+            RegexOptions.Compiled);
+
+    private static readonly Regex BookEpisodeRegex =
+        new(
+            @"(?<![A-Z0-9])L(?<book>\d{1,3})T(?<episode>\d{1,3})(?![A-Z0-9])",
+            RegexOptions.IgnoreCase |
+            RegexOptions.Compiled);
+
+    private static readonly Regex KaamelottEpisodeRegex =
+        new(
+            @"(?<![A-Z0-9])(?:L(?<book>\d{1,3})T(?<episode>\d{1,3})|S(?<season>\d{1,3})E(?<episode2>\d{1,3}))(?![A-Z0-9])",
+            RegexOptions.IgnoreCase |
+            RegexOptions.Compiled);
+
     public MainWindow()
     {
         InitializeComponent();
@@ -69,10 +135,13 @@ public partial class MainWindow : Window
 
     private static string GetDefaultDownloadFolder()
     {
-        var userProfile = Environment.GetFolderPath(
-            Environment.SpecialFolder.UserProfile);
+        var userProfile =
+            Environment.GetFolderPath(
+                Environment.SpecialFolder.UserProfile);
 
-        return Path.Combine(userProfile, "Downloads");
+        return Path.Combine(
+            userProfile,
+            "Downloads");
     }
 
     private void SetInterfaceBusy(bool busy)
@@ -82,6 +151,10 @@ public partial class MainWindow : Window
         ClearButton.IsEnabled = !busy;
         AnalyzeButton.IsEnabled = !busy;
     }
+
+    // ============================================================
+    // VALIDATION DU LIEN FREEBOX
+    // ============================================================
 
     private static bool IsValidFreeboxShareUri(Uri uri)
     {
@@ -101,7 +174,8 @@ public partial class MainWindow : Window
             return false;
         }
 
-        var host = uri.Host.TrimEnd('.');
+        var host =
+            uri.Host.TrimEnd('.');
 
         var isFreeboxHost =
             host.Equals(
@@ -177,175 +251,710 @@ public partial class MainWindow : Window
         }
 
         uri = candidate;
+
         return true;
     }
 
-    private async void BrowseButton_Click(
-        object? sender,
-        RoutedEventArgs e)
+    // ============================================================
+    // PARCOURS DU DOSSIER
+    // ============================================================
+
+    private enum RootKind
     {
-        try
-        {
-            var currentPath = DestinationBox.Text?.Trim();
-
-            IStorageFolder? suggestedStartLocation = null;
-
-            if (!string.IsNullOrWhiteSpace(currentPath) &&
-                Directory.Exists(currentPath))
-            {
-                try
-                {
-                    suggestedStartLocation =
-                        await StorageProvider.TryGetFolderFromPathAsync(
-                            currentPath);
-                }
-                catch
-                {
-                }
-            }
-
-            var folders =
-                await StorageProvider.OpenFolderPickerAsync(
-                    new FolderPickerOpenOptions
-                    {
-                        Title = "Choisir le dossier de destination",
-                        AllowMultiple = false,
-                        SuggestedStartLocation = suggestedStartLocation
-                    });
-
-            if (folders.Count > 0)
-            {
-                DestinationBox.Text =
-                    folders[0].TryGetLocalPath()
-                    ?? folders[0].Name;
-            }
-        }
-        catch (Exception ex)
-        {
-            await ShowMessageAsync(
-                "Impossible de sélectionner le dossier.\n\n" +
-                ex.Message,
-                "Erreur");
-        }
+        Series,
+        Season,
+        Book,
+        Specials
     }
 
-    private async void PasteButton_Click(
-        object? sender,
-        RoutedEventArgs e)
+    private sealed class RootContext
     {
+        public RootKind Kind { get; init; }
+
+        public string? SeriesName { get; init; }
+
+        public string? SelectedGroup { get; init; }
+
+        public bool IsKaamelott { get; init; }
+    }
+
+    private sealed class DetectedVideo
+    {
+        public Uri Uri { get; init; } = null!;
+
+        public string Series { get; init; } =
+            string.Empty;
+
+        public string Group { get; init; } =
+            string.Empty;
+
+        public string SeasonOrBook { get; init; } =
+            string.Empty;
+
+        public string Episode { get; init; } =
+            string.Empty;
+
+        public bool IsSpecials { get; init; }
+
+        public bool IsKaamelott { get; init; }
+    }
+
+    private static RootContext DetectRootContext(
+        Uri rootUri)
+    {
+        var parts =
+            GetUriPathParts(rootUri);
+
+        if (parts.Length == 0)
+        {
+            return new RootContext
+            {
+                Kind = RootKind.Series
+            };
+        }
+
+        var last =
+            parts[^1];
+
+        if (TryGetSeasonDirectory(
+                last,
+                out _))
+        {
+            var series =
+                parts.Length >= 2
+                    ? parts[^2]
+                    : null;
+
+            return new RootContext
+            {
+                Kind = RootKind.Season,
+                SeriesName = series,
+                SelectedGroup = last,
+                IsKaamelott = false
+            };
+        }
+
+        if (TryGetBookDirectory(
+                last,
+                out _))
+        {
+            var series =
+                parts.Length >= 2
+                    ? parts[^2]
+                    : null;
+
+            return new RootContext
+            {
+                Kind = RootKind.Book,
+                SeriesName = series,
+                SelectedGroup = last,
+                IsKaamelott =
+                    series?.Equals(
+                        "Kaamelott",
+                        StringComparison.OrdinalIgnoreCase)
+                    == true
+            };
+        }
+
+        if (IsSpecialsDirectory(last))
+        {
+            var series =
+                parts.Length >= 2
+                    ? parts[^2]
+                    : null;
+
+            return new RootContext
+            {
+                Kind = RootKind.Specials,
+                SeriesName = series
+            };
+        }
+
+        return new RootContext
+        {
+            Kind = RootKind.Series
+        };
+    }
+
+    private async Task CrawlStructureAsync(
+        Uri rootUri,
+        Uri currentUri,
+        RootContext context,
+        HashSet<string> visited,
+        List<DetectedVideo> detectedVideos,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        var normalizedCurrent =
+            NormalizeUri(currentUri);
+
+        if (!visited.Add(normalizedCurrent))
+        {
+            return;
+        }
+
+        string html;
+
         try
         {
-            var clipboard =
-                TopLevel.GetTopLevel(this)?.Clipboard;
+            html =
+                await _httpClient.GetStringAsync(
+                    currentUri,
+                    cancellationToken);
+        }
+        catch
+        {
+            return;
+        }
 
-            if (clipboard == null)
+        foreach (var link in ExtractLinks(
+                     html,
+                     currentUri))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            if (!IsInsideRoot(
+                    rootUri,
+                    link))
             {
-                await ShowMessageAsync(
-                    "Le presse-papiers n'est pas disponible.",
-                    "Presse-papiers");
-
-                return;
+                continue;
             }
 
-            string? text = null;
+            var path =
+                Uri.UnescapeDataString(
+                    link.AbsolutePath);
 
-            using (var data =
-                   await clipboard.TryGetDataAsync())
+            if (LooksLikeVideo(path))
             {
-                if (data != null)
+                var detected =
+                    TryDetectVideo(
+                        rootUri,
+                        context,
+                        link);
+
+                if (detected != null)
                 {
-                    foreach (var item in data.Items)
+                    /*
+                     * IMPORTANT :
+                     *
+                     * Pour un lien de série complète, on contrôle
+                     * immédiatement le nom de la série dès qu'une
+                     * vidéo valide est rencontrée.
+                     *
+                     * Cela évite de parcourir tout le partage
+                     * lorsqu'une deuxième série est détectée.
+                     *
+                     * Pour un lien Saison/Livre/Specials, la racine
+                     * est déjà ciblée et ce contrôle n'est donc pas
+                     * nécessaire ici.
+                     */
+                    if (context.Kind == RootKind.Series)
                     {
-                        if (!item.Formats.Contains(DataFormat.Text))
+                        if (_detectedSeries.Add(
+                                detected.Series))
                         {
-                            continue;
-                        }
-
-                        var value =
-                            await item.TryGetRawAsync(
-                                DataFormat.Text);
-
-                        if (value is string stringValue)
-                        {
-                            text = stringValue;
-                            break;
+                            if (_detectedSeries.Count > 1)
+                            {
+                                throw new MultipleDownloadGroupException(
+                                    BuildMultipleSeriesMessage());
+                            }
                         }
                     }
+
+                    detectedVideos.Add(
+                        detected);
                 }
+
+                continue;
             }
 
-            if (string.IsNullOrWhiteSpace(text))
+            /*
+             * On continue à parcourir tous les dossiers.
+             *
+             * Cela permet notamment :
+             *
+             * Série/
+             *   Saison 1/
+             *      sous-dossier/
+             *          episode.mkv
+             *
+             * ou :
+             *
+             * Série/
+             *   Specials/
+             *      Bonus/
+             *          episode.mkv
+             */
+            if (LooksLikeDirectory(link))
             {
-                await ShowMessageAsync(
-                    "Le presse-papiers ne contient pas de texte.",
-                    "Presse-papiers");
-
-                return;
+                await CrawlStructureAsync(
+                    rootUri,
+                    link,
+                    context,
+                    visited,
+                    detectedVideos,
+                    cancellationToken);
             }
-
-            text = text.Trim();
-
-            if (!TryGetValidFreeboxShareUri(
-                    text,
-                    out var freeboxUri))
-            {
-                await ShowMessageAsync(
-                    "L'URL collée n'est pas un lien de partage Freebox OS valide.",
-                    "Lien non autorisé");
-
-                return;
-            }
-
-            UrlBox.Text =
-                freeboxUri.AbsoluteUri;
-
-            UrlBox.CaretIndex =
-                UrlBox.Text?.Length ?? 0;
-
-            UrlBox.Focus();
-        }
-        catch (Exception ex)
-        {
-            await ShowMessageAsync(
-                "Impossible de lire le presse-papiers.\n\n" +
-                ex.Message,
-                "Presse-papiers");
         }
     }
 
-    private void ClearButton_Click(
-        object? sender,
-        RoutedEventArgs e)
+    // ============================================================
+    // DÉTECTION D'UNE VIDÉO
+    // ============================================================
+
+    private static DetectedVideo? TryDetectVideo(
+        Uri rootUri,
+        RootContext context,
+        Uri videoUri)
     {
-        _cancellationTokenSource?.Cancel();
+        var parts =
+            GetUriPathParts(videoUri);
 
-        _files.Clear();
+        if (parts.Length == 0)
+        {
+            return null;
+        }
 
-        _detectedSeries.Clear();
-        _detectedDownloadGroups.Clear();
+        var fileName =
+            parts[^1];
 
-        UrlBox.Clear();
+        var standardMatch =
+            StandardEpisodeRegex.Match(
+                Path.GetFileNameWithoutExtension(
+                    fileName));
 
-        Progress.Value = 0;
-        ProgressText.Text = string.Empty;
+        var bookMatch =
+            BookEpisodeRegex.Match(
+                Path.GetFileNameWithoutExtension(
+                    fileName));
 
-        StatusText.Text =
-            "Colle le lien Freebox dans le champ « Lien Freebox », puis clique sur « Analyser ».";
+        var seasonIndex =
+            FindSeasonDirectoryIndex(parts);
 
-        AnalyzeButton.IsEnabled = true;
-        DownloadButton.IsEnabled = false;
-        PasteButton.IsEnabled = true;
-        BrowseButton.IsEnabled = true;
-        ClearButton.IsEnabled = true;
+        var bookIndex =
+            FindBookDirectoryIndex(parts);
 
-        UrlBox.Focus();
+        var specialsIndex =
+            FindSpecialsDirectoryIndex(parts);
+
+        // --------------------------------------------------------
+        // LIEN SUR UNE SAISON
+        // --------------------------------------------------------
+
+        if (context.Kind == RootKind.Season)
+        {
+            if (seasonIndex < 0)
+            {
+                return null;
+            }
+
+            var selected =
+                context.SelectedGroup;
+
+            if (!string.Equals(
+                    parts[seasonIndex],
+                    selected,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            if (!standardMatch.Success)
+            {
+                return null;
+            }
+
+            var series =
+                context.SeriesName;
+
+            if (string.IsNullOrWhiteSpace(series))
+            {
+                return null;
+            }
+
+            var season =
+                parts[seasonIndex];
+
+            return new DetectedVideo
+            {
+                Uri = videoUri,
+                Series = series,
+                Group = season,
+                SeasonOrBook = season,
+                Episode = fileName,
+                IsSpecials = false,
+                IsKaamelott = false
+            };
+        }
+
+        // --------------------------------------------------------
+        // LIEN SUR UN LIVRE KAAMELOTT
+        // --------------------------------------------------------
+
+        if (context.Kind == RootKind.Book)
+        {
+            if (bookIndex < 0)
+            {
+                return null;
+            }
+
+            var selected =
+                context.SelectedGroup;
+
+            if (!string.Equals(
+                    parts[bookIndex],
+                    selected,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            if (!bookMatch.Success &&
+                !standardMatch.Success)
+            {
+                return null;
+            }
+
+            var series =
+                context.SeriesName;
+
+            if (string.IsNullOrWhiteSpace(series))
+            {
+                return null;
+            }
+
+            var book =
+                parts[bookIndex];
+
+            return new DetectedVideo
+            {
+                Uri = videoUri,
+                Series = series,
+                Group = book,
+                SeasonOrBook = book,
+                Episode = fileName,
+                IsSpecials = false,
+                IsKaamelott =
+                    context.IsKaamelott
+            };
+        }
+
+        // --------------------------------------------------------
+        // LIEN SUR SPECIALS
+        // --------------------------------------------------------
+
+        if (context.Kind == RootKind.Specials)
+        {
+            if (specialsIndex < 0)
+            {
+                return null;
+            }
+
+            if (!standardMatch.Success &&
+                !bookMatch.Success)
+            {
+                return null;
+            }
+
+            var series =
+                context.SeriesName;
+
+            if (string.IsNullOrWhiteSpace(series))
+            {
+                return null;
+            }
+
+            return new DetectedVideo
+            {
+                Uri = videoUri,
+                Series = series,
+                Group = "Specials",
+                SeasonOrBook = "Specials",
+                Episode = fileName,
+                IsSpecials = true,
+                IsKaamelott =
+                    series.Equals(
+                        "Kaamelott",
+                        StringComparison.OrdinalIgnoreCase)
+            };
+        }
+
+        // --------------------------------------------------------
+        // LIEN SUR LA SÉRIE COMPLÈTE
+        // --------------------------------------------------------
+
+        if (seasonIndex >= 0)
+        {
+            if (!standardMatch.Success)
+            {
+                return null;
+            }
+
+            if (seasonIndex == 0)
+            {
+                return null;
+            }
+
+            var series =
+                parts[seasonIndex - 1];
+
+            return new DetectedVideo
+            {
+                Uri = videoUri,
+                Series = series,
+                Group = parts[seasonIndex],
+                SeasonOrBook = parts[seasonIndex],
+                Episode = fileName,
+                IsSpecials = false,
+                IsKaamelott = false
+            };
+        }
+
+        // --------------------------------------------------------
+        // KAAMELOTT / LIVRE
+        // --------------------------------------------------------
+
+        if (bookIndex >= 0)
+        {
+            if (!bookMatch.Success &&
+                !standardMatch.Success)
+            {
+                return null;
+            }
+
+            if (bookIndex == 0)
+            {
+                return null;
+            }
+
+            var series =
+                parts[bookIndex - 1];
+
+            return new DetectedVideo
+            {
+                Uri = videoUri,
+                Series = series,
+                Group = parts[bookIndex],
+                SeasonOrBook = parts[bookIndex],
+                Episode = fileName,
+                IsSpecials = false,
+                IsKaamelott =
+                    series.Equals(
+                        "Kaamelott",
+                        StringComparison.OrdinalIgnoreCase)
+            };
+        }
+
+        // --------------------------------------------------------
+        // SPECIALS DANS UNE SÉRIE
+        // --------------------------------------------------------
+
+        if (specialsIndex >= 0)
+        {
+            if (!standardMatch.Success &&
+                !bookMatch.Success)
+            {
+                return null;
+            }
+
+            if (specialsIndex == 0)
+            {
+                return null;
+            }
+
+            var series =
+                parts[specialsIndex - 1];
+
+            return new DetectedVideo
+            {
+                Uri = videoUri,
+                Series = series,
+                Group = "Specials",
+                SeasonOrBook = "Specials",
+                Episode = fileName,
+                IsSpecials = true,
+                IsKaamelott =
+                    series.Equals(
+                        "Kaamelott",
+                        StringComparison.OrdinalIgnoreCase)
+            };
+        }
+
+        return null;
     }
+
+    // ============================================================
+    // VALIDATION DU CONTEXTE SPECIALS
+    // ============================================================
+
+    private async Task<bool> ValidateSpecialsRootAsync(
+        Uri specialsUri,
+        RootContext context,
+        CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(
+                context.SeriesName))
+        {
+            return false;
+        }
+
+        var parentUri =
+            GetParentUri(specialsUri);
+
+        if (parentUri == null)
+        {
+            return false;
+        }
+
+        string html;
+
+        try
+        {
+            html =
+                await _httpClient.GetStringAsync(
+                    parentUri,
+                    cancellationToken);
+        }
+        catch
+        {
+            return false;
+        }
+
+        foreach (var link in ExtractLinks(
+                     html,
+                     parentUri))
+        {
+            var name =
+                GetLastPathPart(link);
+
+            if (TryGetSeasonDirectory(
+                    name,
+                    out _))
+            {
+                return true;
+            }
+
+            if (TryGetBookDirectory(
+                    name,
+                    out _))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // ============================================================
+    // VALIDATION DE LA SÉRIE
+    // ============================================================
+
+    private static bool IsValidDetectedSet(
+        RootContext context,
+        IReadOnlyCollection<DetectedVideo> videos)
+    {
+        if (videos.Count == 0)
+        {
+            return false;
+        }
+
+        if (context.Kind == RootKind.Season ||
+            context.Kind == RootKind.Book)
+        {
+            return true;
+        }
+
+        if (context.Kind == RootKind.Specials)
+        {
+            return videos.Any(
+                video => video.IsSpecials);
+        }
+
+        return videos.Any(
+            video => !video.IsSpecials);
+    }
+
+    // ============================================================
+    // AJOUT DES VIDÉOS À LA LISTE
+    // ============================================================
+
+    private void AddDetectedVideo(
+        DetectedVideo detected)
+    {
+        if (!_detectedSeries.Add(
+                detected.Series))
+        {
+            // Série déjà connue : OK.
+        }
+        else if (_detectedSeries.Count > 1)
+        {
+            throw new MultipleDownloadGroupException(
+                BuildMultipleSeriesMessage());
+        }
+
+        if (_detectedDownloadGroups.Add(
+                $"{detected.Series}\\{detected.Group}"))
+        {
+            /*
+             * Une série complète contient naturellement
+             * plusieurs saisons/livres.
+             *
+             * Ils sont donc autorisés lorsque le lien racine
+             * est une série.
+             */
+        }
+
+        if (_files.Any(
+                file =>
+                    file.Url.Equals(
+                        detected.Uri.AbsoluteUri,
+                        StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        var normalizedPath =
+            NormalizeDetectedPath(
+                detected);
+
+        if (string.IsNullOrWhiteSpace(
+                normalizedPath))
+        {
+            return;
+        }
+
+        _files.Add(
+            new VideoFile
+            {
+                Url = detected.Uri.AbsoluteUri,
+                RelativePath = normalizedPath,
+                Status = "En attente"
+            });
+    }
+
+    private static string NormalizeDetectedPath(
+        DetectedVideo detected)
+    {
+        return Path.Combine(
+            SanitizePathPart(
+                detected.Series),
+            SanitizePathPart(
+                detected.SeasonOrBook),
+            SanitizeFileName(
+                detected.Episode));
+    }
+
+    // ============================================================
+    // ANALYSE
+    // ============================================================
 
     private async void AnalyzeButton_Click(
         object? sender,
         RoutedEventArgs e)
     {
-        var urlText = UrlBox.Text?.Trim();
+        var urlText =
+            UrlBox.Text?.Trim();
 
         if (!TryGetValidFreeboxShareUri(
                 urlText ?? string.Empty,
@@ -366,6 +975,7 @@ public partial class MainWindow : Window
         try
         {
             SetInterfaceBusy(true);
+
             DownloadButton.IsEnabled = false;
 
             _files.Clear();
@@ -378,15 +988,88 @@ public partial class MainWindow : Window
             StatusText.Text =
                 "Analyse du partage Freebox...";
 
+            var context =
+                DetectRootContext(rootUri);
+
+            if (context.Kind == RootKind.Specials)
+            {
+                var valid =
+                    await ValidateSpecialsRootAsync(
+                        rootUri,
+                        context,
+                        _cancellationTokenSource.Token);
+
+                if (!valid)
+                {
+                    StatusText.Text =
+                        "Aucun épisode trouvé.";
+
+                    await ShowMessageAsync(
+                        "Le dossier « Specials » ne peut pas être " +
+                        "considéré comme une série à lui seul.\n\n" +
+                        "Aucune Saison ou aucun Livre correspondant " +
+                        "n'a été trouvé dans le dossier parent.",
+                        "Série non reconnue");
+
+                    return;
+                }
+            }
+
             var visited =
                 new HashSet<string>(
                     StringComparer.OrdinalIgnoreCase);
 
+            var detectedVideos =
+                new List<DetectedVideo>();
+
             await CrawlStructureAsync(
                 rootUri,
                 rootUri,
+                context,
                 visited,
+                detectedVideos,
                 _cancellationTokenSource.Token);
+
+            if (context.Kind == RootKind.Series)
+            {
+                var hasRegularEpisodes =
+                    detectedVideos.Any(
+                        video => !video.IsSpecials);
+
+                if (!hasRegularEpisodes)
+                {
+                    detectedVideos.Clear();
+                }
+            }
+
+            if (!IsValidDetectedSet(
+                    context,
+                    detectedVideos))
+            {
+                StatusText.Text =
+                    "Aucun épisode trouvé.";
+
+                await ShowMessageAsync(
+                    "Aucun fichier vidéo correspondant à une série " +
+                    "ou à une saison valide n'a été trouvé.",
+                    "Série non reconnue");
+
+                return;
+            }
+
+            foreach (var detected in detectedVideos)
+            {
+                _cancellationTokenSource.Token
+                    .ThrowIfCancellationRequested();
+
+                AddDetectedVideo(detected);
+            }
+
+            if (_detectedSeries.Count > 1)
+            {
+                throw new MultipleDownloadGroupException(
+                    BuildMultipleSeriesMessage());
+            }
 
             if (_files.Count == 0)
             {
@@ -394,6 +1077,31 @@ public partial class MainWindow : Window
                     "Aucun épisode trouvé.";
 
                 return;
+            }
+
+            if (context.Kind != RootKind.Series)
+            {
+                var groups =
+                    detectedVideos
+                        .Select(
+                            video =>
+                                video.Group)
+                        .Distinct(
+                            StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                if (groups.Count > 1)
+                {
+                    await ShowMessageAsync(
+                        "Plusieurs groupes de téléchargement ont été " +
+                        "détectés alors qu'un lien ciblé avait été fourni.\n\n" +
+                        string.Join("\n", groups),
+                        "Téléchargement bloqué");
+
+                    _files.Clear();
+
+                    return;
+                }
             }
 
             StatusText.Text =
@@ -406,7 +1114,8 @@ public partial class MainWindow : Window
             StatusText.Text =
                 $"{_files.Count} épisode(s) trouvé(s).";
 
-            DownloadButton.IsEnabled = true;
+            DownloadButton.IsEnabled =
+                _files.Count > 0;
         }
         catch (OperationCanceledException)
         {
@@ -439,119 +1148,9 @@ public partial class MainWindow : Window
         }
     }
 
-    private async Task CrawlStructureAsync(
-        Uri rootUri,
-        Uri currentUri,
-        HashSet<string> visited,
-        CancellationToken cancellationToken)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-
-        if (!visited.Add(currentUri.AbsoluteUri))
-        {
-            return;
-        }
-
-        string html;
-
-        try
-        {
-            html = await _httpClient.GetStringAsync(
-                currentUri,
-                cancellationToken);
-        }
-        catch
-        {
-            return;
-        }
-
-        foreach (var link in ExtractLinks(html, currentUri))
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            if (!IsInsideShare(rootUri, link))
-            {
-                continue;
-            }
-
-            var path =
-                Uri.UnescapeDataString(
-                    link.AbsolutePath);
-
-            if (LooksLikeVideo(path))
-            {
-                AddVideo(link, rootUri);
-                continue;
-            }
-
-            if (LooksLikeDirectory(link))
-            {
-                await CrawlStructureAsync(
-                    rootUri,
-                    link,
-                    visited,
-                    cancellationToken);
-            }
-        }
-    }
-
-    private void AddVideo(
-        Uri uri,
-        Uri rootUri)
-    {
-        var relativePath =
-            GetRelativePath(rootUri, uri);
-
-        var structure =
-            DetectVideoStructure(relativePath);
-
-        if (structure == null)
-        {
-            return;
-        }
-
-        if (_detectedSeries.Add(structure.Series) &&
-            _detectedSeries.Count > 1)
-        {
-            throw new MultipleDownloadGroupException(
-                BuildMultipleSeriesMessage());
-        }
-
-        if (_detectedDownloadGroups.Add(
-                structure.DownloadGroup) &&
-            _detectedDownloadGroups.Count > 1)
-        {
-            throw new MultipleDownloadGroupException(
-                BuildMultipleDownloadGroupsMessage(
-                    structure.Series));
-        }
-
-        if (_files.Any(file =>
-                file.Url.Equals(
-                    uri.AbsoluteUri,
-                    StringComparison.OrdinalIgnoreCase)))
-        {
-            return;
-        }
-
-        var normalizedPath =
-            NormalizeVideoPath(
-                relativePath,
-                structure);
-
-        if (string.IsNullOrWhiteSpace(normalizedPath))
-        {
-            return;
-        }
-
-        _files.Add(
-            new VideoFile
-            {
-                Url = uri.AbsoluteUri,
-                RelativePath = normalizedPath,
-                Status = "En attente"
-            });
-    }
+    // ============================================================
+    // PARCOURS DES URL
+    // ============================================================
 
     private static IEnumerable<Uri> ExtractLinks(
         string html,
@@ -569,6 +1168,18 @@ public partial class MainWindow : Window
                 WebUtility.HtmlDecode(
                     match.Groups[1].Value);
 
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                continue;
+            }
+
+            if (value.StartsWith(
+                    "#",
+                    StringComparison.Ordinal))
+            {
+                continue;
+            }
+
             if (Uri.TryCreate(
                     baseUri,
                     value,
@@ -579,7 +1190,7 @@ public partial class MainWindow : Window
         }
     }
 
-    private static bool IsInsideShare(
+    private static bool IsInsideRoot(
         Uri rootUri,
         Uri uri)
     {
@@ -592,308 +1203,244 @@ public partial class MainWindow : Window
         }
 
         var rootPath =
-            rootUri.AbsolutePath.TrimEnd('/') + "/";
+            Uri.UnescapeDataString(
+                rootUri.AbsolutePath)
+            .TrimEnd('/');
 
-        return uri.AbsolutePath.StartsWith(
-            rootPath,
+        var candidatePath =
+            Uri.UnescapeDataString(
+                uri.AbsolutePath);
+
+        if (string.Equals(
+                rootPath,
+                candidatePath,
+                StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        return candidatePath.StartsWith(
+            rootPath + "/",
             StringComparison.OrdinalIgnoreCase);
     }
 
-    private static bool LooksLikeDirectory(Uri uri)
+    private static bool LooksLikeDirectory(
+        Uri uri)
     {
-        return uri.AbsolutePath.EndsWith(
-            "/",
-            StringComparison.Ordinal);
+        if (uri.AbsolutePath.EndsWith(
+                "/",
+                StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return !LooksLikeVideo(
+            Uri.UnescapeDataString(
+                uri.AbsolutePath));
     }
 
-    private static bool LooksLikeVideo(string path)
+    private static bool LooksLikeVideo(
+        string path)
     {
         return VideoExtensions.Contains(
             Path.GetExtension(path));
     }
 
-    private static string GetRelativePath(
-        Uri rootUri,
-        Uri fileUri)
-    {
-        var rootPath =
-            rootUri.AbsolutePath.TrimEnd('/') + "/";
+    // ============================================================
+    // ANALYSE DES CHEMINS
+    // ============================================================
 
-        var filePath =
+    private static string[] GetUriPathParts(
+        Uri uri)
+    {
+        var path =
             Uri.UnescapeDataString(
-                fileUri.AbsolutePath);
+                uri.AbsolutePath);
 
-        if (filePath.StartsWith(
-                rootPath,
-                StringComparison.OrdinalIgnoreCase))
-        {
-            filePath =
-                filePath[rootPath.Length..];
-        }
-
-        return filePath.Replace(
-            '/',
-            Path.DirectorySeparatorChar);
-    }
-
-    private static string[] SplitPath(
-        string path)
-    {
         return path
-            .Replace('\\', '/')
             .Split(
                 '/',
                 StringSplitOptions.RemoveEmptyEntries |
                 StringSplitOptions.TrimEntries);
     }
 
-    private static VideoStructure? DetectVideoStructure(
-        string relativePath)
+    private static string GetLastPathPart(
+        Uri uri)
     {
-        var parts = SplitPath(relativePath);
+        var parts =
+            GetUriPathParts(uri);
 
-        if (parts.Length < 2)
+        return parts.Length == 0
+            ? string.Empty
+            : parts[^1];
+    }
+
+    private static int FindSeasonDirectoryIndex(
+        string[] parts)
+    {
+        for (var i = 0;
+             i < parts.Length;
+             i++)
+        {
+            if (TryGetSeasonDirectory(
+                    parts[i],
+                    out _))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static int FindBookDirectoryIndex(
+        string[] parts)
+    {
+        for (var i = 0;
+             i < parts.Length;
+             i++)
+        {
+            if (TryGetBookDirectory(
+                    parts[i],
+                    out _))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static int FindSpecialsDirectoryIndex(
+        string[] parts)
+    {
+        for (var i = 0;
+             i < parts.Length;
+             i++)
+        {
+            if (IsSpecialsDirectory(
+                    parts[i]))
+            {
+                return i;
+            }
+        }
+
+        return -1;
+    }
+
+    private static bool TryGetSeasonDirectory(
+        string value,
+        out int number)
+    {
+        number = 0;
+
+        var match =
+            SeasonDirectoryRegex.Match(
+                value.Trim());
+
+        if (!match.Success)
+        {
+            return false;
+        }
+
+        var numberText =
+            match.Groups["number"].Success
+                ? match.Groups["number"].Value
+                : match.Groups["short"].Value;
+
+        return int.TryParse(
+            numberText,
+            out number);
+    }
+
+    private static bool TryGetBookDirectory(
+        string value,
+        out string roman)
+    {
+        roman = string.Empty;
+
+        var match =
+            BookDirectoryRegex.Match(
+                value.Trim());
+
+        if (!match.Success)
+        {
+            return false;
+        }
+
+        roman =
+            match.Groups["number"]
+                .Value
+                .ToUpperInvariant();
+
+        return IsValidRomanNumeral(
+            roman);
+    }
+
+    private static bool IsSpecialsDirectory(
+        string value)
+    {
+        return SpecialsDirectoryRegex.IsMatch(
+            value.Trim());
+    }
+
+    private static bool IsValidRomanNumeral(
+        string value)
+    {
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            return false;
+        }
+
+        return Regex.IsMatch(
+            value,
+            @"^(?=[MDCLXVI])M{0,4}(CM|CD|D?C{0,3})(XC|XL|L?X{0,3})(IX|IV|V?I{0,3})$",
+            RegexOptions.IgnoreCase);
+    }
+
+    // ============================================================
+    // URL PARENT
+    // ============================================================
+
+    private static Uri? GetParentUri(
+        Uri uri)
+    {
+        var builder =
+            new UriBuilder(uri);
+
+        var path =
+            builder.Path.TrimEnd('/');
+
+        var slash =
+            path.LastIndexOf('/');
+
+        if (slash <= 0)
         {
             return null;
         }
 
-        if (IsKaamelottPath(parts))
-        {
-            var seriesIndex =
-                FindKaamelottSeriesIndex(parts);
+        builder.Path =
+            path[..(slash + 1)];
 
-            if (seriesIndex < 0)
-            {
-                return null;
-            }
-
-            var series = parts[seriesIndex];
-
-            var bookIndex =
-                FindBookIndex(
-                    parts,
-                    seriesIndex + 1);
-
-            if (bookIndex < 0 ||
-                bookIndex >= parts.Length - 1)
-            {
-                return null;
-            }
-
-            var book = parts[bookIndex];
-
-            return new VideoStructure
-            {
-                Series = series,
-                DownloadGroup = $"{series}\\{book}",
-                Season = book,
-                Episode = parts[^1],
-                IsKaamelott = true
-            };
-        }
-
-        var seasonIndex =
-            FindSeasonIndex(parts);
-
-        if (seasonIndex > 0 &&
-            seasonIndex < parts.Length - 1)
-        {
-            var series = parts[seasonIndex - 1];
-            var season = parts[seasonIndex];
-
-            return new VideoStructure
-            {
-                Series = series,
-                DownloadGroup = series,
-                Season = season,
-                Episode = parts[^1]
-            };
-        }
-
-        var specialsIndex =
-            FindSpecialsIndex(parts);
-
-        if (specialsIndex > 0 &&
-            specialsIndex < parts.Length - 1)
-        {
-            var series = parts[specialsIndex - 1];
-            var specials = parts[specialsIndex];
-
-            return new VideoStructure
-            {
-                Series = series,
-                DownloadGroup = $"{series}\\{specials}",
-                Season = specials,
-                Episode = parts[^1],
-                IsSpecials = true
-            };
-        }
-
-        var seasonFromFile =
-            DetectSeasonFromFileName(parts[^1]);
-
-        if (!string.IsNullOrWhiteSpace(seasonFromFile))
-        {
-            return new VideoStructure
-            {
-                Series = parts[0],
-                DownloadGroup = parts[0],
-                Season = seasonFromFile,
-                Episode = parts[^1]
-            };
-        }
-
-        return null;
+        return builder.Uri;
     }
 
-    private static bool IsKaamelottPath(
-        string[] parts)
+    private static string NormalizeUri(
+        Uri uri)
     {
-        return parts.Any(
-            part => part.Equals(
-                "Kaamelott",
-                StringComparison.OrdinalIgnoreCase));
+        return uri.AbsoluteUri.TrimEnd('/');
     }
 
-    private static int FindKaamelottSeriesIndex(
-        string[] parts)
-    {
-        for (var i = 0; i < parts.Length; i++)
-        {
-            if (parts[i].Equals(
-                    "Kaamelott",
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                return i;
-            }
-        }
-
-        return -1;
-    }
-
-    private static int FindBookIndex(
-        string[] parts,
-        int startIndex)
-    {
-        for (var i = startIndex;
-             i < parts.Length;
-             i++)
-        {
-            if (Regex.IsMatch(
-                    parts[i].Trim(),
-                    @"^Livre\s+.+$",
-                    RegexOptions.IgnoreCase))
-            {
-                return i;
-            }
-        }
-
-        return -1;
-    }
-
-    private static int FindSpecialsIndex(
-        string[] parts)
-    {
-        for (var i = 0; i < parts.Length; i++)
-        {
-            if (parts[i].Equals(
-                    "Specials",
-                    StringComparison.OrdinalIgnoreCase))
-            {
-                return i;
-            }
-        }
-
-        return -1;
-    }
-
-    private static int FindSeasonIndex(
-        string[] parts)
-    {
-        for (var i = 0; i < parts.Length; i++)
-        {
-            var part = parts[i].Trim();
-
-            if (Regex.IsMatch(
-                    part,
-                    @"^(saison|season)\s*\d+$",
-                    RegexOptions.IgnoreCase))
-            {
-                return i;
-            }
-
-            if (Regex.IsMatch(
-                    part,
-                    @"^s\d+$",
-                    RegexOptions.IgnoreCase))
-            {
-                return i;
-            }
-        }
-
-        return -1;
-    }
-
-    private static string DetectSeasonFromFileName(
-        string fileName)
-    {
-        var match =
-            Regex.Match(
-                fileName,
-                @"\bS(?<season>\d{1,3})E\d{1,3}\b",
-                RegexOptions.IgnoreCase);
-
-        if (!match.Success)
-        {
-            return string.Empty;
-        }
-
-        var season =
-            int.Parse(
-                match.Groups["season"].Value);
-
-        return $"S{season:00}";
-    }
-
-    private static string NormalizeVideoPath(
-        string relativePath,
-        VideoStructure structure)
-    {
-        return Path.Combine(
-            SanitizePathPart(structure.Series),
-            SanitizePathPart(structure.Season),
-            SanitizeFileName(structure.Episode));
-    }
-
-    private static string SanitizePathPart(
-        string value)
-    {
-        foreach (var invalidCharacter
-                 in Path.GetInvalidFileNameChars())
-        {
-            value =
-                value.Replace(
-                    invalidCharacter.ToString(),
-                    string.Empty);
-        }
-
-        value = value.Trim();
-
-        return string.IsNullOrWhiteSpace(value)
-            ? "Inconnu"
-            : value;
-    }
-
-    private static string SanitizeFileName(
-        string value)
-    {
-        return SanitizePathPart(value);
-    }
+    // ============================================================
+    // TAILLE DES FICHIERS
+    // ============================================================
 
     private async Task LoadSizesAsync(
         CancellationToken cancellationToken)
     {
-        var total = _files.Count;
+        var total =
+            _files.Count;
+
         var processed = 0;
 
         foreach (var file in _files)
@@ -960,7 +1507,9 @@ public partial class MainWindow : Window
                     uri);
 
             request.Headers.Range =
-                new RangeHeaderValue(0, 0);
+                new RangeHeaderValue(
+                    0,
+                    0);
 
             using var response =
                 await _httpClient.SendAsync(
@@ -993,6 +1542,10 @@ public partial class MainWindow : Window
         return 0;
     }
 
+    // ============================================================
+    // TÉLÉCHARGEMENT
+    // ============================================================
+
     private async void DownloadButton_Click(
         object? sender,
         RoutedEventArgs e)
@@ -1005,7 +1558,8 @@ public partial class MainWindow : Window
         var destination =
             DestinationBox.Text?.Trim();
 
-        if (string.IsNullOrWhiteSpace(destination))
+        if (string.IsNullOrWhiteSpace(
+                destination))
         {
             await ShowMessageAsync(
                 "Choisis un dossier de destination.",
@@ -1017,9 +1571,11 @@ public partial class MainWindow : Window
         try
         {
             destination =
-                Path.GetFullPath(destination);
+                Path.GetFullPath(
+                    destination);
 
-            Directory.CreateDirectory(destination);
+            Directory.CreateDirectory(
+                destination);
         }
         catch (Exception ex)
         {
@@ -1037,6 +1593,7 @@ public partial class MainWindow : Window
             new CancellationTokenSource();
 
         SetInterfaceBusy(true);
+
         DownloadButton.IsEnabled = false;
 
         Progress.Value = 0;
@@ -1060,7 +1617,6 @@ public partial class MainWindow : Window
                             file,
                             destination,
                             semaphore,
-                            totalBytes,
                             () =>
                             {
                                 var completed =
@@ -1090,7 +1646,8 @@ public partial class MainWindow : Window
                             _cancellationTokenSource.Token))
                 .ToArray();
 
-            await Task.WhenAll(tasks);
+            await Task.WhenAll(
+                tasks);
 
             Progress.Value = 100;
 
@@ -1135,7 +1692,6 @@ public partial class MainWindow : Window
         VideoFile file,
         string destinationRoot,
         SemaphoreSlim semaphore,
-        long totalBytes,
         Action updateProgress,
         Action<long> addBytes,
         CancellationToken cancellationToken)
@@ -1155,16 +1711,19 @@ public partial class MainWindow : Window
         catch (OperationCanceledException)
         {
             await Dispatcher.UIThread.InvokeAsync(
-                () => file.Status = "Annulé");
+                () =>
+                    file.Status = "Annulé");
 
             throw;
         }
         catch (Exception ex)
         {
             await Dispatcher.UIThread.InvokeAsync(
-                () => file.Status = "Erreur");
+                () =>
+                    file.Status = "Erreur");
 
-            System.Diagnostics.Debug.WriteLine(ex);
+            System.Diagnostics.Debug.WriteLine(
+                ex);
         }
         finally
         {
@@ -1207,11 +1766,14 @@ public partial class MainWindow : Window
         }
 
         var directory =
-            Path.GetDirectoryName(destination);
+            Path.GetDirectoryName(
+                destination);
 
-        if (!string.IsNullOrWhiteSpace(directory))
+        if (!string.IsNullOrWhiteSpace(
+                directory))
         {
-            Directory.CreateDirectory(directory);
+            Directory.CreateDirectory(
+                directory);
         }
 
         long existingBytes = 0;
@@ -1219,13 +1781,16 @@ public partial class MainWindow : Window
         if (File.Exists(destination))
         {
             existingBytes =
-                new FileInfo(destination).Length;
+                new FileInfo(
+                    destination).Length;
 
             if (file.Size > 0 &&
                 existingBytes >= file.Size)
             {
                 await Dispatcher.UIThread.InvokeAsync(
-                    () => file.Status = "Déjà présent");
+                    () =>
+                        file.Status =
+                            "Déjà présent");
 
                 return;
             }
@@ -1300,7 +1865,9 @@ public partial class MainWindow : Window
                 cancellationToken)) > 0)
         {
             await output.WriteAsync(
-                buffer.AsMemory(0, bytesRead),
+                buffer.AsMemory(
+                    0,
+                    bytesRead),
                 cancellationToken);
 
             addBytes(bytesRead);
@@ -1308,45 +1875,242 @@ public partial class MainWindow : Window
         }
 
         await Dispatcher.UIThread.InvokeAsync(
-            () => file.Status = "Terminé");
+            () =>
+                file.Status = "Terminé");
     }
+
+    // ============================================================
+    // PRESSE-PAPIERS
+    // ============================================================
+
+    private async void PasteButton_Click(
+        object? sender,
+        RoutedEventArgs e)
+    {
+        try
+        {
+            var clipboard =
+                TopLevel.GetTopLevel(
+                    this)?.Clipboard;
+
+            if (clipboard == null)
+            {
+                await ShowMessageAsync(
+                    "Le presse-papiers n'est pas disponible.",
+                    "Presse-papiers");
+
+                return;
+            }
+
+            string? text = null;
+
+            using (var data =
+                   await clipboard.TryGetDataAsync())
+            {
+                if (data != null)
+                {
+                    foreach (var item in data.Items)
+                    {
+                        if (!item.Formats.Contains(
+                                DataFormat.Text))
+                        {
+                            continue;
+                        }
+
+                        var value =
+                            await item.TryGetRawAsync(
+                                DataFormat.Text);
+
+                        if (value is string stringValue)
+                        {
+                            text = stringValue;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                await ShowMessageAsync(
+                    "Le presse-papiers ne contient pas de texte.",
+                    "Presse-papiers");
+
+                return;
+            }
+
+            text =
+                text.Trim();
+
+            if (!TryGetValidFreeboxShareUri(
+                    text,
+                    out var freeboxUri))
+            {
+                await ShowMessageAsync(
+                    "L'URL collée n'est pas un lien de partage Freebox OS valide.",
+                    "Lien non autorisé");
+
+                return;
+            }
+
+            UrlBox.Text =
+                freeboxUri.AbsoluteUri;
+
+            UrlBox.CaretIndex =
+                UrlBox.Text?.Length ?? 0;
+
+            UrlBox.Focus();
+        }
+        catch (Exception ex)
+        {
+            await ShowMessageAsync(
+                "Impossible de lire le presse-papiers.\n\n" +
+                ex.Message,
+                "Presse-papiers");
+        }
+    }
+
+    // ============================================================
+    // NAVIGATION DOSSIER LOCAL
+    // ============================================================
+
+    private async void BrowseButton_Click(
+        object? sender,
+        RoutedEventArgs e)
+    {
+        try
+        {
+            var currentPath =
+                DestinationBox.Text?.Trim();
+
+            IStorageFolder? suggestedStartLocation = null;
+
+            if (!string.IsNullOrWhiteSpace(
+                    currentPath) &&
+                Directory.Exists(
+                    currentPath))
+            {
+                try
+                {
+                    suggestedStartLocation =
+                        await StorageProvider
+                            .TryGetFolderFromPathAsync(
+                                currentPath);
+                }
+                catch
+                {
+                }
+            }
+
+            var folders =
+                await StorageProvider
+                    .OpenFolderPickerAsync(
+                        new FolderPickerOpenOptions
+                        {
+                            Title =
+                                "Choisir le dossier de destination",
+
+                            AllowMultiple = false,
+
+                            SuggestedStartLocation =
+                                suggestedStartLocation
+                        });
+
+            if (folders.Count > 0)
+            {
+                DestinationBox.Text =
+                    folders[0].TryGetLocalPath()
+                    ?? folders[0].Name;
+            }
+        }
+        catch (Exception ex)
+        {
+            await ShowMessageAsync(
+                "Impossible de sélectionner le dossier.\n\n" +
+                ex.Message,
+                "Erreur");
+        }
+    }
+
+    // ============================================================
+    // EFFACER
+    // ============================================================
+
+    private void ClearButton_Click(
+        object? sender,
+        RoutedEventArgs e)
+    {
+        _cancellationTokenSource?.Cancel();
+
+        _files.Clear();
+
+        _detectedSeries.Clear();
+        _detectedDownloadGroups.Clear();
+
+        UrlBox.Clear();
+
+        Progress.Value = 0;
+        ProgressText.Text = string.Empty;
+
+        StatusText.Text =
+            "Colle le lien Freebox dans le champ « Lien Freebox », " +
+            "puis clique sur « Analyser ».";
+
+        AnalyzeButton.IsEnabled = true;
+        DownloadButton.IsEnabled = false;
+        PasteButton.IsEnabled = true;
+        BrowseButton.IsEnabled = true;
+        ClearButton.IsEnabled = true;
+
+        UrlBox.Focus();
+    }
+
+    // ============================================================
+    // CHEMINS LOCAUX
+    // ============================================================
+
+    private static string SanitizePathPart(
+        string value)
+    {
+        foreach (var invalidCharacter
+                 in Path.GetInvalidFileNameChars())
+        {
+            value =
+                value.Replace(
+                    invalidCharacter.ToString(),
+                    string.Empty);
+        }
+
+        value =
+            value.Trim();
+
+        return string.IsNullOrWhiteSpace(
+                value)
+            ? "Inconnu"
+            : value;
+    }
+
+    private static string SanitizeFileName(
+        string value)
+    {
+        return SanitizePathPart(
+            value);
+    }
+
+    // ============================================================
+    // MESSAGES
+    // ============================================================
 
     private string BuildMultipleSeriesMessage()
     {
         return
             "Plusieurs séries ont été détectées dans ce partage.\n\n" +
-            string.Join("\n", _detectedSeries) +
+            string.Join(
+                "\n",
+                _detectedSeries) +
             "\n\n" +
             "Téléchargement bloqué.\n\n" +
             "Veuillez télécharger les séries une par une.";
-    }
-
-    private string BuildMultipleDownloadGroupsMessage(
-        string series)
-    {
-        var groups =
-            _detectedDownloadGroups.ToList();
-
-        if (series.Equals(
-                "Kaamelott",
-                StringComparison.OrdinalIgnoreCase))
-        {
-            return
-                "Plusieurs Livres de Kaamelott ont été détectés " +
-                "dans ce partage.\n\n" +
-                string.Join("\n", groups) +
-                "\n\n" +
-                "Téléchargement bloqué.\n\n" +
-                "Pour éviter un téléchargement trop important, " +
-                "Kaamelott doit être téléchargé Livre par Livre.";
-        }
-
-        return
-            "Plusieurs groupes de téléchargement ont été détectés " +
-            $"pour la série « {series} ».\n\n" +
-            string.Join("\n", groups) +
-            "\n\n" +
-            "Téléchargement bloqué.";
     }
 
     private async Task ShowMessageAsync(
@@ -1358,13 +2122,15 @@ public partial class MainWindow : Window
             {
                 Title = title,
                 Width = 500,
-                SizeToContent = SizeToContent.Height,
+                SizeToContent =
+                    SizeToContent.Height,
                 CanResize = false,
                 WindowStartupLocation =
                     WindowStartupLocation.CenterOwner,
                 Background =
                     new Avalonia.Media.SolidColorBrush(
-                        Avalonia.Media.Color.Parse("#FFFFFF"))
+                        Avalonia.Media.Color.Parse(
+                            "#FFFFFF"))
             };
 
         var text =
@@ -1375,24 +2141,29 @@ public partial class MainWindow : Window
                     Avalonia.Media.TextWrapping.Wrap,
                 Foreground =
                     new Avalonia.Media.SolidColorBrush(
-                        Avalonia.Media.Color.Parse("#202124"))
+                        Avalonia.Media.Color.Parse(
+                            "#202124"))
             };
 
         var buttonBackground =
             new Avalonia.Media.SolidColorBrush(
-                Avalonia.Media.Color.Parse("#E8EDF3"));
+                Avalonia.Media.Color.Parse(
+                    "#E8EDF3"));
 
         var buttonHoverBackground =
             new Avalonia.Media.SolidColorBrush(
-                Avalonia.Media.Color.Parse("#DCE2E9"));
+                Avalonia.Media.Color.Parse(
+                    "#DCE2E9"));
 
         var buttonPressedBackground =
             new Avalonia.Media.SolidColorBrush(
-                Avalonia.Media.Color.Parse("#CDD5DE"));
+                Avalonia.Media.Color.Parse(
+                    "#CDD5DE"));
 
         var buttonBorder =
             new Avalonia.Media.SolidColorBrush(
-                Avalonia.Media.Color.Parse("#C9CED6"));
+                Avalonia.Media.Color.Parse(
+                    "#C9CED6"));
 
         var buttonText =
             new TextBlock
@@ -1401,7 +2172,8 @@ public partial class MainWindow : Window
                 FontSize = 13,
                 Foreground =
                     new Avalonia.Media.SolidColorBrush(
-                        Avalonia.Media.Color.Parse("#202124")),
+                        Avalonia.Media.Color.Parse(
+                            "#202124")),
                 HorizontalAlignment =
                     Avalonia.Layout.HorizontalAlignment.Center,
                 VerticalAlignment =
@@ -1413,14 +2185,20 @@ public partial class MainWindow : Window
             {
                 Width = 90,
                 Height = 38,
-                Background = buttonBackground,
-                BorderBrush = buttonBorder,
-                BorderThickness = new Thickness(1),
-                CornerRadius = new CornerRadius(4),
+                Background =
+                    buttonBackground,
+                BorderBrush =
+                    buttonBorder,
+                BorderThickness =
+                    new Thickness(1),
+                CornerRadius =
+                    new CornerRadius(4),
                 HorizontalAlignment =
                     Avalonia.Layout.HorizontalAlignment.Right,
                 Child = buttonText,
-                Cursor = new Cursor(StandardCursorType.Hand)
+                Cursor =
+                    new Cursor(
+                        StandardCursorType.Hand)
             };
 
         okButton.PointerEntered +=
@@ -1457,18 +2235,25 @@ public partial class MainWindow : Window
             new StackPanel
             {
                 Spacing = 20,
-                Margin = new Thickness(20)
+                Margin =
+                    new Thickness(20)
             };
 
         panel.Children.Add(text);
         panel.Children.Add(okButton);
 
-        dialog.Content = panel;
+        dialog.Content =
+            panel;
 
         await dialog.ShowDialog(this);
     }
 
-    private static string FormatBytes(long bytes)
+    // ============================================================
+    // FORMATAGE
+    // ============================================================
+
+    private static string FormatBytes(
+        long bytes)
     {
         if (bytes < 1024)
         {
@@ -1485,18 +2270,40 @@ public partial class MainWindow : Window
             return $"{bytes / 1024.0 / 1024.0:0.##} Mo";
         }
 
-        if (bytes < 1024L * 1024 * 1024 * 1024)
+        if (bytes <
+            1024L * 1024 * 1024 * 1024)
         {
-            return $"{bytes / 1024.0 / 1024.0 / 1024.0:0.##} Go";
+            return
+                $"{bytes / 1024.0 / 1024.0 / 1024.0:0.##} Go";
         }
 
-        return $"{bytes / 1024.0 / 1024.0 / 1024.0 / 1024.0:0.##} To";
+        return
+            $"{bytes / 1024.0 / 1024.0 / 1024.0 / 1024.0:0.##} To";
     }
 }
 
+// ==================================================================
+// EXCEPTION
+// ==================================================================
+
+internal sealed class MultipleDownloadGroupException :
+    Exception
+{
+    public MultipleDownloadGroupException(
+        string message)
+        : base(message)
+    {
+    }
+}
+
+// ==================================================================
+// VIDEO STRUCTURE
+// ==================================================================
+
 internal sealed class VideoStructure
 {
-    public string Series { get; init; } = string.Empty;
+    public string Series { get; init; } =
+        string.Empty;
 
     public string DownloadGroup { get; init; } =
         string.Empty;
@@ -1512,21 +2319,20 @@ internal sealed class VideoStructure
     public bool IsSpecials { get; init; }
 }
 
-internal sealed class MultipleDownloadGroupException :
-    Exception
-{
-    public MultipleDownloadGroupException(
-        string message)
-        : base(message)
-    {
-    }
-}
+// ==================================================================
+// VIDEO FILE
+// ==================================================================
 
-public sealed class VideoFile : INotifyPropertyChanged
+public sealed class VideoFile :
+    INotifyPropertyChanged
 {
-    private string _relativePath = string.Empty;
+    private string _relativePath =
+        string.Empty;
+
     private long _size;
-    private string _status = "En attente";
+
+    private string _status =
+        "En attente";
 
     public string Url { get; set; } =
         string.Empty;
@@ -1543,6 +2349,7 @@ public sealed class VideoFile : INotifyPropertyChanged
             }
 
             _relativePath = value;
+
             OnPropertyChanged();
         }
     }
@@ -1561,7 +2368,8 @@ public sealed class VideoFile : INotifyPropertyChanged
             _size = value;
 
             OnPropertyChanged();
-            OnPropertyChanged(nameof(SizeText));
+            OnPropertyChanged(
+                nameof(SizeText));
         }
     }
 
@@ -1582,6 +2390,7 @@ public sealed class VideoFile : INotifyPropertyChanged
             }
 
             _status = value;
+
             OnPropertyChanged();
         }
     }
@@ -1590,14 +2399,17 @@ public sealed class VideoFile : INotifyPropertyChanged
         PropertyChanged;
 
     private void OnPropertyChanged(
-        [CallerMemberName] string? propertyName = null)
+        [CallerMemberName]
+        string? propertyName = null)
     {
         PropertyChanged?.Invoke(
             this,
-            new PropertyChangedEventArgs(propertyName));
+            new PropertyChangedEventArgs(
+                propertyName));
     }
 
-    private static string FormatBytes(long bytes)
+    private static string FormatBytes(
+        long bytes)
     {
         if (bytes < 1024)
         {
@@ -1609,16 +2421,21 @@ public sealed class VideoFile : INotifyPropertyChanged
             return $"{bytes / 1024.0:0.##} Ko";
         }
 
-        if (bytes < 1024L * 1024 * 1024)
+        if (bytes <
+            1024L * 1024 * 1024)
         {
-            return $"{bytes / 1024.0 / 1024.0:0.##} Mo";
+            return
+                $"{bytes / 1024.0 / 1024.0:0.##} Mo";
         }
 
-        if (bytes < 1024L * 1024 * 1024 * 1024)
+        if (bytes <
+            1024L * 1024 * 1024 * 1024)
         {
-            return $"{bytes / 1024.0 / 1024.0 / 1024.0:0.##} Go";
+            return
+                $"{bytes / 1024.0 / 1024.0 / 1024.0:0.##} Go";
         }
 
-        return $"{bytes / 1024.0 / 1024.0 / 1024.0 / 1024.0:0.##} To";
+        return
+            $"{bytes / 1024.0 / 1024.0 / 1024.0 / 1024.0:0.##} To";
     }
 }

@@ -10,7 +10,7 @@
     MinHeight="600"
     Background="#F4F6F8"
     RequestedThemeVariant="Light"
-    Icon="/Assets/freebox.ico">
+    Icon="/Assets/PTN.ico">
 
     <Window.Styles>
 

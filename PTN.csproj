@@ -10,16 +10,35 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
 
+    <!-- Publication autonome et Single File -->
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
-    <IncludeAllContentForSelfExtract>true</IncludeAllContentForSelfExtract>
 
     <DebugType>None</DebugType>
     <DebugSymbols>false</DebugSymbols>
 
-    <!-- Icône de l'exécutable Windows -->
-    <ApplicationIcon>Assets\freebox.ico</ApplicationIcon>
+    <!-- Icône Windows -->
+    <ApplicationIcon Condition="'$(RuntimeIdentifier)' == 'win-x64'">Assets\PTN.ico</ApplicationIcon>
+
+    <!-- AppHost nécessaire pour les applications natives -->
+    <UseAppHost>true</UseAppHost>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'osx-x64'">
+    <OutputType>Exe</OutputType>
+    <AssemblyName>PTN</AssemblyName>
+    <ApplicationTitle>Pas l'Temps d'Niaiser !</ApplicationTitle>
+    <ApplicationVersion>1.0.0</ApplicationVersion>
+    <RuntimeIdentifier>osx-x64</RuntimeIdentifier>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">
+    <OutputType>Exe</OutputType>
+    <AssemblyName>PTN</AssemblyName>
+    <ApplicationTitle>Pas l'Temps d'Niaiser !</ApplicationTitle>
+    <ApplicationVersion>1.0.0</ApplicationVersion>
+    <RuntimeIdentifier>osx-arm64</RuntimeIdentifier>
   </PropertyGroup>
 
   <ItemGroup>
@@ -28,10 +47,11 @@
     <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.9" />
 
     <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.0" />
+
+    <PackageReference Include="Tmds.DBus.Protocol" Version="0.21.3" />
   </ItemGroup>
 
   <ItemGroup>
-    <!-- Ressources Avalonia -->
     <AvaloniaResource Include="Assets\**" />
   </ItemGroup>
 
