@@ -8,7 +8,8 @@ Elle permet le téléchargement en lot de séries (ou de saisons spécifiques) p
 
 L'application est fonctionnelle mais toujours en version de test et peut donc présenter des bugs.
 
-<img width="1052" height="752" alt="image" src="https://github.com/user-attachments/assets/a0631335-d216-439a-94a8-9126584eb133" />
+<img width="1052" height="752" alt="image" src="https://github.com/user-attachments/assets/6ee80a36-74f9-4ddd-ba43-c43fe80a316c" />
+
 
 
 
